@@ -1,17 +1,12 @@
 import os
+from dotenv import load_dotenv
 
-# Telegram bot token
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8497175069:AAHu_4D8YHWMvmpwFLj-yuEe51Gntd8rjsI")
+# Load environment variables from .env file
+load_dotenv()
 
-# PostgreSQL database connection URL
-DB_URL = os.getenv("DB_URL", "postgres://postgres:Aj421981@127.0.0.1:5432/test")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# State for ConversationHandler
-(
-    ADD_EXPENSE_AMOUNT,
-    ADD_EXPENSE_CATEGORY,
-    ADD_EXPENSE_DESCRIPTION,
-    SET_BUDGET_CATEGORY,
-    SET_BUDGET_AMOUNT,
-    DELETE_EXPENSE_ID
-) = range(6)
+# State constants for ConversationHandler
+ADD_EXPENSE_AMOUNT, ADD_EXPENSE_CATEGORY, ADD_EXPENSE_DESCRIPTION = range(3)
+SET_BUDGET_CATEGORY, SET_BUDGET_AMOUNT = range(2)
+DELETE_EXPENSE_ID = range(1)

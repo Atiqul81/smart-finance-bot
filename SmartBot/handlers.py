@@ -1,9 +1,8 @@
 import logging
-from telegram import Update
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import ContextTypes, ConversationHandler
-import psycopg2
 from decimal import Decimal
-from datetime import datetime, timedelta
+from datetime import datetime
 from database import get_db_connection
 from config import (
     ADD_EXPENSE_AMOUNT,
@@ -14,339 +13,246 @@ from config import (
     DELETE_EXPENSE_ID,
 )
 
-# Logging setup
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+# --- Utility Functions ---
+
+def get_or_create_category_id(cur, user_id, category_name):
+    cur.execute("SELECT id FROM categories WHERE user_id = %s AND name = %s", (user_id, category_name))
+    category = cur.fetchone()
+    if category:
+        return category[0]
+    else:
+        cur.execute("INSERT INTO categories (user_id, name) VALUES (%s, %s) RETURNING id", (user_id, category_name))
+        return cur.fetchone()[0]
+
+def get_expense_categories(user_id):
+    categories = []
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT name FROM categories WHERE user_id = %s ORDER BY name", (user_id,))
+                categories = [row[0] for row in cur.fetchall()]
+    except Exception:
+        logging.exception(f"Error retrieving categories for user {user_id}")
+    return categories
+
+def build_category_keyboard(categories):
+    keyboard = [[category] for category in categories]
+    return ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+
+# --- Command Handlers ---
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles the /start command."""
     user_id = update.effective_user.id
     first_name = update.effective_user.first_name
-    
-    conn = None
     try:
-        conn = get_db_connection()
-        cur = conn.cursor()
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO users (user_id, first_name) VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE SET first_name = EXCLUDED.first_name", (user_id, first_name))
         
-        cur.execute("INSERT INTO users (user_id, first_name) VALUES (%s, %s) ON CONFLICT (user_id) DO NOTHING", (user_id, first_name))
-        conn.commit()
-        
-        await update.message.reply_text(f'Hello, {first_name}! I am your personal budget manager. Use me to track your expenses.')
-    
-    except (Exception, psycopg2.DatabaseError) as error:
-        logging.error(f"Error in start_command: {error}")
+        keyboard = [['/add_expense', '/view_expenses'], ['/report', '/set_budget', '/view_budget'], ['/delete_expense']]
+        reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=False, resize_keyboard=True)
+        await update.message.reply_text(
+            f'Hello, {first_name}! I am your personal budget manager. Use the buttons below or type a command to get started.',
+            reply_markup=reply_markup
+        )
+    except Exception:
+        logging.exception(f"Error in start_command for user {user_id}")
         await update.message.reply_text("I'm sorry, I couldn't set up your account. Please try again later.")
-    finally:
-        if conn:
-            cur.close()
-            conn.close()
 
 async def add_expense_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Starts the conversation to add a new expense."""
-    await update.message.reply_text('Please enter the amount of your expense:')
+    await update.message.reply_text("Please enter the amount of your expense:")
     return ADD_EXPENSE_AMOUNT
 
 async def add_expense_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Stores the expense amount and asks for the category."""
     try:
-        amount = Decimal(update.message.text)
+        amount = Decimal(update.message.text.strip())
         if amount <= 0:
             await update.message.reply_text("Amount must be a positive number. Please try again.")
             return ADD_EXPENSE_AMOUNT
         context.user_data['amount'] = amount
-        await update.message.reply_text('Please enter the category of your expense (e.g., Food, Transport):')
+        
+        categories = get_expense_categories(update.effective_user.id)
+        keyboard = build_category_keyboard(categories) if categories else None
+        await update.message.reply_text('Please select a category or type a new one:', reply_markup=keyboard)
         return ADD_EXPENSE_CATEGORY
     except (ValueError, Exception):
         await update.message.reply_text("Invalid amount. Please enter a valid number.")
         return ADD_EXPENSE_AMOUNT
 
 async def add_expense_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Stores the category and asks for a description."""
-    context.user_data['category'] = update.message.text
-    await update.message.reply_text('Please enter a short description for the expense:')
+    context.user_data['category'] = update.message.text.strip()
+    await update.message.reply_text("Great! Now, please enter a short description for the expense:")
     return ADD_EXPENSE_DESCRIPTION
 
 async def add_expense_description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Stores the description and saves the expense to the database."""
-    context.user_data['description'] = update.message.text
-    
+    context.user_data['description'] = update.message.text.strip()
     amount = context.user_data['amount']
     category_name = context.user_data['category']
     description = context.user_data['description']
     user_id = update.effective_user.id
     
-    conn = None
     try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        # Check if user exists
-        cur.execute("SELECT user_id FROM users WHERE user_id = %s", (user_id,))
-        user_exists = cur.fetchone()
-        if not user_exists:
-            first_name = update.effective_user.first_name
-            cur.execute("INSERT INTO users (user_id, first_name) VALUES (%s, %s)", (user_id, first_name))
-            conn.commit()
-
-        # Find or create category
-        cur.execute("SELECT id FROM categories WHERE user_id = %s AND name = %s", (user_id, category_name))
-        category = cur.fetchone()
-        category_id = None
-        if not category:
-            cur.execute("INSERT INTO categories (user_id, name) VALUES (%s, %s) RETURNING id", (user_id, category_name))
-            category_id = cur.fetchone()[0]
-        else:
-            category_id = category[0]
-
-        # Insert expense
-        cur.execute("INSERT INTO expenses (user_id, category_id, amount, description) VALUES (%s, %s, %s, %s)",
-                    (user_id, category_id, amount, description))
-        conn.commit()
-        
-        await update.message.reply_text(f'Expense of {amount} in category "{category_name}" has been saved.')
-        
-    except (Exception, psycopg2.DatabaseError) as error:
-        logging.error(f"Error adding expense: {error}")
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                category_id = get_or_create_category_id(cur, user_id, category_name)
+                cur.execute("INSERT INTO expenses (user_id, category_id, amount, description) VALUES (%s, %s, %s, %s)",
+                            (user_id, category_id, amount, description))
+        await update.message.reply_text(
+            f'✅ Expense of {amount} in category "{category_name}" has been saved successfully!',
+            reply_markup=ReplyKeyboardRemove()
+        )
+    except Exception:
+        logging.exception(f"Error adding expense for user {user_id}")
         await update.message.reply_text("I'm sorry, an error occurred while saving your expense. Please try again later.")
     finally:
-        if conn:
-            cur.close()
-            conn.close()
-
-    return ConversationHandler.END
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Cancels and ends the conversation."""
-    await update.message.reply_text('Operation cancelled.')
+        context.user_data.clear()
     return ConversationHandler.END
 
 async def view_expenses_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles the /view_expenses command to show all expenses."""
     user_id = update.effective_user.id
-    conn = None
     try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        cur.execute("""
-            SELECT e.id, e.amount, c.name, e.description, e.created_at
-            FROM expenses e
-            JOIN categories c ON e.category_id = c.id
-            WHERE e.user_id = %s
-            ORDER BY e.created_at DESC
-        """, (user_id,))
-        expenses = cur.fetchall()
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT e.id, e.amount, c.name, e.description, e.date
+                    FROM expenses e LEFT JOIN categories c ON e.category_id = c.id
+                    WHERE e.user_id = %s ORDER BY e.date DESC LIMIT 10
+                """, (user_id,))
+                expenses = cur.fetchall()
         
         if not expenses:
-            await update.message.reply_text("You have not recorded any expenses yet.")
+            await update.message.reply_text('You have no expenses recorded yet. Use /add_expense to start.')
             return
-
-        message = "Your expenses:\n\n"
+            
+        message = "Your 10 latest expenses:\n\n"
         for expense in expenses:
-            exp_id, amount, category, description, created_at = expense
-            message += f"ID: {exp_id}\nAmount: {amount}\nCategory: {category}\nDescription: {description}\nDate: {created_at.strftime('%Y-%m-%d')}\n\n"
-        
-        await update.message.reply_text(message)
-
-    except (Exception, psycopg2.DatabaseError) as error:
-        logging.error(f"Error in view_expenses_command: {error}")
+            message += f"🆔 *ID:* {expense[0]}\n💵 *Amount:* {expense[1]:.2f}\n📂 *Category:* {expense[2] or 'N/A'}\n📝 *Description:* {expense[3] or 'N/A'}\n📅 *Date:* {expense[4].strftime('%Y-%m-%d')}\n\n"
+        await update.message.reply_text(message, parse_mode='Markdown')
+    except Exception:
+        logging.exception(f"Error retrieving expenses for user {user_id}")
         await update.message.reply_text("I'm sorry, an error occurred while retrieving your expenses.")
-    finally:
-        if conn:
-            cur.close()
-            conn.close()
 
 async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles the /report command to show weekly and monthly expense summaries."""
     user_id = update.effective_user.id
-    conn = None
     try:
-        conn = get_db_connection()
-        cur = conn.cursor()
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                today = datetime.now()
+                start_of_month = today.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+                
+                cur.execute("SELECT SUM(amount) FROM expenses WHERE user_id = %s AND date >= %s", (user_id, start_of_month))
+                total_expense = cur.fetchone()[0]
 
-        today = datetime.now().date()
-        week_ago = today - timedelta(days=7)
-        month_ago = today - timedelta(days=30)
-        
-        message = "Expense Report:\n\n"
+                if total_expense is None:
+                    await update.message.reply_text("You have no expenses recorded this month.")
+                    return
 
-        # Weekly Report
-        cur.execute("""
-            SELECT SUM(amount) FROM expenses WHERE user_id = %s AND created_at >= %s
-        """, (user_id, week_ago))
-        weekly_total = cur.fetchone()[0] or Decimal(0)
+                cur.execute("""
+                    SELECT c.name, SUM(e.amount) FROM expenses e JOIN categories c ON e.category_id = c.id
+                    WHERE e.user_id = %s AND e.date >= %s GROUP BY c.name ORDER BY SUM(e.amount) DESC
+                """, (user_id, start_of_month))
+                category_expenses = cur.fetchall()
 
-        message += f"**This Week:** {weekly_total:.2f}\n"
-
-        # Monthly Report
-        cur.execute("""
-            SELECT SUM(amount) FROM expenses WHERE user_id = %s AND created_at >= %s
-        """, (user_id, month_ago))
-        monthly_total = cur.fetchone()[0] or Decimal(0)
-        
-        message += f"**This Month:** {monthly_total:.2f}\n\n"
-
-        # Category-wise Report (This Month)
-        cur.execute("""
-            SELECT c.name, SUM(e.amount)
-            FROM expenses e
-            JOIN categories c ON e.category_id = c.id
-            WHERE e.user_id = %s AND e.created_at >= %s
-            GROUP BY c.name
-            ORDER BY SUM(e.amount) DESC
-        """, (user_id, month_ago))
-        monthly_categories = cur.fetchall()
-
-        if monthly_categories:
-            message += "**This Month by Category:**\n"
-            for category_name, total_amount in monthly_categories:
-                message += f"  - {category_name}: {total_amount:.2f}\n"
-
-        await update.message.reply_text(message)
-
-    except (Exception, psycopg2.DatabaseError) as error:
-        logging.error(f"Error in report_command: {error}")
-        await update.message.reply_text("I'm sorry, an error occurred while generating the report.")
-    finally:
-        if conn:
-            cur.close()
-            conn.close()
+        message = f"📊 *Monthly Report for {today.strftime('%B, %Y')}*\n\nTotal Expenses: *{total_expense:.2f}*\n\n*Breakdown by Category:*\n"
+        for category, amount in category_expenses:
+            message += f"- {category}: {amount:.2f}\n"
+        await update.message.reply_text(message, parse_mode='Markdown')
+    except Exception:
+        logging.exception(f"Error generating report for user {user_id}")
+        await update.message.reply_text("I'm sorry, an error occurred while generating your report.")
 
 async def set_budget_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Starts the conversation to set a budget."""
-    await update.message.reply_text('Please enter the category you want to set a budget for:')
+    categories = get_expense_categories(update.effective_user.id)
+    keyboard = build_category_keyboard(categories) if categories else None
+    await update.message.reply_text('Please select a category for the budget or type a new one:', reply_markup=keyboard)
     return SET_BUDGET_CATEGORY
 
 async def set_budget_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Stores the budget category and asks for the amount."""
-    context.user_data['budget_category'] = update.message.text
-    await update.message.reply_text(f'Please enter the monthly budget amount for "{update.message.text}":')
+    context.user_data['budget_category'] = update.message.text.strip()
+    await update.message.reply_text("Please enter the monthly budget amount for this category:")
     return SET_BUDGET_AMOUNT
 
 async def set_budget_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Stores the budget amount and saves it to the database."""
+    user_id = update.effective_user.id
+    category_name = context.user_data['budget_category']
+    amount_text = update.message.text.strip()
+    
     try:
-        amount = Decimal(update.message.text)
+        amount = Decimal(amount_text)
         if amount <= 0:
-            await update.message.reply_text("Budget amount must be a positive number. Please try again.")
+            await update.message.reply_text("Amount must be a positive number. Please try again.")
             return SET_BUDGET_AMOUNT
-        
-        category_name = context.user_data['budget_category']
-        user_id = update.effective_user.id
-        
-        conn = None
-        try:
-            conn = get_db_connection()
-            cur = conn.cursor()
             
-            # Check if category already exists for the user
-            cur.execute("SELECT id FROM categories WHERE user_id = %s AND name = %s", (user_id, category_name))
-            category = cur.fetchone()
-            
-            if category:
-                # If category exists, update the budget
-                cur.execute("UPDATE categories SET budget = %s WHERE id = %s", (amount, category[0]))
-            else:
-                # If not, insert a new category with the budget
-                cur.execute("INSERT INTO categories (user_id, name, budget) VALUES (%s, %s, %s)", (user_id, category_name, amount))
-            
-            conn.commit()
-            
-            await update.message.reply_text(f'Monthly budget of {amount} has been set for category "{category_name}".')
-        
-        except (Exception, psycopg2.DatabaseError) as error:
-            logging.error(f"Error setting budget: {error}")
-            await update.message.reply_text("I'm sorry, an error occurred while setting your budget.")
-        finally:
-            if conn:
-                cur.close()
-                conn.close()
-        
-    except (ValueError, Exception):
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                category_id = get_or_create_category_id(cur, user_id, category_name)
+                cur.execute("""
+                    INSERT INTO budgets (user_id, category_id, amount) VALUES (%s, %s, %s)
+                    ON CONFLICT (user_id, category_id) DO UPDATE SET amount = EXCLUDED.amount
+                """, (user_id, category_id, amount))
+        await update.message.reply_text(f'✅ Budget of {amount} for category "{category_name}" has been set successfully!', reply_markup=ReplyKeyboardRemove())
+    except ValueError:
         await update.message.reply_text("Invalid amount. Please enter a valid number.")
         return SET_BUDGET_AMOUNT
-    
+    except Exception:
+        logging.exception(f"Error setting budget for user {user_id}")
+        await update.message.reply_text("I'm sorry, an error occurred while setting your budget.")
+    finally:
+        context.user_data.clear()
     return ConversationHandler.END
 
 async def view_budget_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles the /view_budget command to show budgets and spending."""
     user_id = update.effective_user.id
-    conn = None
     try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        cur.execute("""
-            SELECT c.name, c.budget, SUM(e.amount) as total_spent
-            FROM categories c
-            LEFT JOIN expenses e ON c.id = e.category_id AND e.created_at >= date_trunc('month', NOW())
-            WHERE c.user_id = %s
-            GROUP BY c.id
-            ORDER BY c.name
-        """, (user_id,))
-        budgets = cur.fetchall()
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT c.name, b.amount FROM budgets b JOIN categories c ON b.category_id = c.id
+                    WHERE b.user_id = %s ORDER BY c.name
+                """, (user_id,))
+                budgets = cur.fetchall()
         
         if not budgets:
-            await update.message.reply_text("You have not set any budgets yet.")
+            await update.message.reply_text('You have no budgets set yet. Use /set_budget to create one.')
             return
-
-        message = "Your Monthly Budgets & Spending:\n\n"
-        for category_name, budget_amount, total_spent in budgets:
-            total_spent = total_spent or Decimal(0)
-            remaining = budget_amount - total_spent
             
-            message += f"**Category:** {category_name}\n"
-            message += f"  - Budget: {budget_amount:.2f}\n"
-            message += f"  - Spent: {total_spent:.2f}\n"
-            message += f"  - Remaining: {remaining:.2f}\n\n"
-            
-        await update.message.reply_text(message)
-
-    except (Exception, psycopg2.DatabaseError) as error:
-        logging.error(f"Error in view_budget_command: {error}")
+        message = "Your current monthly budgets:\n\n"
+        for budget in budgets:
+            message += f"📂 *{budget[0]}*: {budget[1]:.2f}\n"
+        await update.message.reply_text(message, parse_mode='Markdown')
+    except Exception:
+        logging.exception(f"Error retrieving budgets for user {user_id}")
         await update.message.reply_text("I'm sorry, an error occurred while retrieving your budgets.")
-    finally:
-        if conn:
-            cur.close()
-            conn.close()
 
 async def delete_expense_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Starts the conversation to delete an expense."""
-    await update.message.reply_text('To delete an expense, please provide the Expense ID:')
+    await view_expenses_command(update, context) # This might show an error if view_expenses fails, which is okay.
+    await update.message.reply_text("\nAbove are your recent expenses. Please enter the ID of the expense you want to delete:")
     return DELETE_EXPENSE_ID
-
-async def delete_expense_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Deletes the expense from the database."""
-    user_id = update.effective_user.id
-    try:
-        expense_id = int(update.message.text)
-        
-        conn = None
-        try:
-            conn = get_db_connection()
-            cur = conn.cursor()
-            
-            # Delete the expense, but only if it belongs to the current user
-            cur.execute("DELETE FROM expenses WHERE id = %s AND user_id = %s", (expense_id, user_id))
-            
-            if cur.rowcount > 0:
-                conn.commit()
-                await update.message.reply_text(f'Expense with ID {expense_id} has been deleted.')
-            else:
-                await update.message.reply_text(f'No expense found with ID {expense_id} for your account.')
-                
-        except (Exception, psycopg2.DatabaseError) as error:
-            logging.error(f"Error deleting expense: {error}")
-            await update.message.reply_text("I'm sorry, an error occurred while deleting your expense.")
-        finally:
-            if conn:
-                cur.close()
-                conn.close()
     
+async def delete_expense_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    expense_id_text = update.message.text.strip()
+    try:
+        expense_id = int(expense_id_text)
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM expenses WHERE id = %s AND user_id = %s RETURNING id", (expense_id, user_id))
+                deleted_row = cur.fetchone()
+        
+        if deleted_row:
+            await update.message.reply_text(f'✅ Expense with ID {expense_id} has been deleted.')
+        else:
+            await update.message.reply_text('⚠️ No expense found with that ID or you do not have permission to delete it.')
     except ValueError:
         await update.message.reply_text("Invalid ID. Please enter a valid number.")
-        return DELETE_EXPENSE_ID
-    
+    except Exception:
+        logging.exception(f"Error deleting expense {expense_id_text} for user {user_id}")
+        await update.message.reply_text("An error occurred while trying to delete the expense.")
+    return ConversationHandler.END
+
+# Dummy cancel function for states without a specific one.
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Cancels and ends the conversation."""
+    await update.message.reply_text('Operation cancelled.', reply_markup=ReplyKeyboardRemove())
+    context.user_data.clear()
     return ConversationHandler.END
