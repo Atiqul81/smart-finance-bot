@@ -3,6 +3,7 @@ from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
+    CallbackQueryHandler,  # <-- This is now imported
     ConversationHandler,
     MessageHandler,
     filters
@@ -10,6 +11,7 @@ from telegram.ext import (
 from database import setup_database
 from handlers import (
     start_command,
+    button_handler,  # <-- Our new button handler is imported
     add_expense_command,
     add_expense_amount,
     add_expense_category,
@@ -42,13 +44,11 @@ logging.basicConfig(
 
 def main():
     """Starts the bot."""
-    # Setup database at the start
     setup_database()
     
-    # Create the Application and pass it your bot's token.
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # Add conversation handler for adding expenses
+    # --- Conversation Handlers ---
     add_expense_conv_handler = ConversationHandler(
         entry_points=[CommandHandler(['add_expense', 'add', 'a'], add_expense_command)],
         states={
@@ -57,10 +57,9 @@ def main():
             ADD_EXPENSE_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_expense_description)],
         },
         fallbacks=[CommandHandler('cancel', cancel)],
-        per_message=False # Ensures conversation flows correctly
+        per_message=False
     )
 
-    # Add conversation handler for setting budgets
     set_budget_conv_handler = ConversationHandler(
         entry_points=[CommandHandler(['set_budget', 'set', 'sb'], set_budget_command)],
         states={
@@ -71,7 +70,6 @@ def main():
         per_message=False
     )
 
-    # Add conversation handler for deleting expenses
     delete_expense_conv_handler = ConversationHandler(
         entry_points=[CommandHandler(['delete_expense', 'delete', 'd'], delete_expense_command)],
         states={
@@ -81,16 +79,24 @@ def main():
         per_message=False
     )
     
-    # Add all handlers to the application
+    # --- Add all handlers to the application ---
+    
+    # Add main command handlers
     application.add_handler(CommandHandler(["start", "s"], start_command))
+    
+    # This handler is for the buttons. It should be added before the conversations.
+    application.add_handler(CallbackQueryHandler(button_handler))
+
+    # Add conversation handlers
     application.add_handler(add_expense_conv_handler)
     application.add_handler(set_budget_conv_handler)
     application.add_handler(delete_expense_conv_handler)
+
+    # These handlers allow direct command access as well
     application.add_handler(CommandHandler(["view_expenses", "view", "v"], view_expenses_command))
     application.add_handler(CommandHandler(["report", "r"], report_command))
     application.add_handler(CommandHandler(["view_budget", "v_budget", "vb"], view_budget_command))
 
-    # Run the bot until the user presses Ctrl-C
     logging.info("Bot is polling...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 

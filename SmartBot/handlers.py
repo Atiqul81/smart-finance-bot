@@ -1,5 +1,5 @@
 import logging
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import ContextTypes, ConversationHandler
 from decimal import Decimal
 from datetime import datetime
@@ -39,7 +39,7 @@ def build_category_keyboard(categories):
     keyboard = [[category] for category in categories]
     return ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
 
-# --- Command Handlers ---
+# --- Main Command and Button Handlers ---
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -49,20 +49,57 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             with conn.cursor() as cur:
                 cur.execute("INSERT INTO users (user_id, first_name) VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE SET first_name = EXCLUDED.first_name", (user_id, first_name))
         
-        keyboard = [['/add_expense', '/view_expenses'], ['/report', '/set_budget', '/view_budget'], ['/delete_expense']]
-        reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=False, resize_keyboard=True)
+        keyboard = [
+            [InlineKeyboardButton("➕ Add Expense", callback_data='add_expense')],
+            [
+                InlineKeyboardButton("📊 View Report", callback_data='report'),
+                InlineKeyboardButton("👁️ View Expenses", callback_data='view_expenses')
+            ],
+            [
+                InlineKeyboardButton("💰 Set Budget", callback_data='set_budget'),
+                InlineKeyboardButton("🗑️ Delete Expense", callback_data='delete_expense')
+            ],
+            [InlineKeyboardButton("🏦 View Budgets", callback_data='view_budget')] # <-- View Budget Button
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
         await update.message.reply_text(
-            f'Hello, {first_name}! I am your personal budget manager. Use the buttons below or type a command to get started.',
+            f'👋 Hello, {first_name}!\n\nWelcome to your Personal Finance Manager. Use the buttons below to get started.',
             reply_markup=reply_markup
         )
     except Exception:
         logging.exception(f"Error in start_command for user {user_id}")
-        await update.message.reply_text("I'm sorry, I couldn't set up your account. Please try again later.")
+        await update.message.reply_text("I'm sorry, an error occurred while setting up your account. Please try again later.")
 
-async def add_expense_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("Please enter the amount of your expense:")
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    command = query.data
+
+    if command == 'add_expense':
+        await add_expense_command(query.message, context, is_button=True)
+    elif command == 'view_expenses':
+        await view_expenses_command(query.message, context)
+    elif command == 'report':
+        await report_command(query.message, context)
+    elif command == 'set_budget':
+        await set_budget_command(query.message, context, is_button=True)
+    elif command == 'delete_expense':
+        await delete_expense_command(query.message, context, is_button=True)
+    elif command == 'view_budget': # <-- Added handler for the new button
+        await view_budget_command(query.message, context)
+
+
+# --- Conversation Handlers and other functions ---
+
+async def add_expense_command(update: Update, context: ContextTypes.DEFAULT_TYPE, is_button=False) -> int:
+    message = "Please enter the amount of your expense:"
+    # To prevent errors, we check if the update object is a message or a callback query
+    target = update.edit_message_text if is_button else update.reply_text
+    await target(text=message)
     return ADD_EXPENSE_AMOUNT
 
+# ... (add_expense_amount, add_expense_category, add_expense_description are the same)
 async def add_expense_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
         amount = Decimal(update.message.text.strip())
@@ -70,7 +107,6 @@ async def add_expense_amount(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.message.reply_text("Amount must be a positive number. Please try again.")
             return ADD_EXPENSE_AMOUNT
         context.user_data['amount'] = amount
-        
         categories = get_expense_categories(update.effective_user.id)
         keyboard = build_category_keyboard(categories) if categories else None
         await update.message.reply_text('Please select a category or type a new one:', reply_markup=keyboard)
@@ -90,7 +126,6 @@ async def add_expense_description(update: Update, context: ContextTypes.DEFAULT_
     category_name = context.user_data['category']
     description = context.user_data['description']
     user_id = update.effective_user.id
-    
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
@@ -108,6 +143,7 @@ async def add_expense_description(update: Update, context: ContextTypes.DEFAULT_
         context.user_data.clear()
     return ConversationHandler.END
 
+
 async def view_expenses_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     try:
@@ -119,18 +155,17 @@ async def view_expenses_command(update: Update, context: ContextTypes.DEFAULT_TY
                     WHERE e.user_id = %s ORDER BY e.date DESC LIMIT 10
                 """, (user_id,))
                 expenses = cur.fetchall()
-        
         if not expenses:
-            await update.message.reply_text('You have no expenses recorded yet. Use /add_expense to start.')
+            await update.reply_text('You have no expenses recorded yet. Use "Add Expense" to start.')
             return
-            
         message = "Your 10 latest expenses:\n\n"
         for expense in expenses:
             message += f"🆔 *ID:* {expense[0]}\n💵 *Amount:* {expense[1]:.2f}\n📂 *Category:* {expense[2] or 'N/A'}\n📝 *Description:* {expense[3] or 'N/A'}\n📅 *Date:* {expense[4].strftime('%Y-%m-%d')}\n\n"
-        await update.message.reply_text(message, parse_mode='Markdown')
+        await update.reply_text(message, parse_mode='Markdown')
     except Exception:
         logging.exception(f"Error retrieving expenses for user {user_id}")
-        await update.message.reply_text("I'm sorry, an error occurred while retrieving your expenses.")
+        await update.reply_text("I'm sorry, an error occurred while retrieving your expenses.")
+
 
 async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -139,34 +174,35 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             with conn.cursor() as cur:
                 today = datetime.now()
                 start_of_month = today.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-                
                 cur.execute("SELECT SUM(amount) FROM expenses WHERE user_id = %s AND date >= %s", (user_id, start_of_month))
                 total_expense = cur.fetchone()[0]
-
                 if total_expense is None:
-                    await update.message.reply_text("You have no expenses recorded this month.")
+                    await update.reply_text("You have no expenses recorded this month.")
                     return
-
                 cur.execute("""
                     SELECT c.name, SUM(e.amount) FROM expenses e JOIN categories c ON e.category_id = c.id
                     WHERE e.user_id = %s AND e.date >= %s GROUP BY c.name ORDER BY SUM(e.amount) DESC
                 """, (user_id, start_of_month))
                 category_expenses = cur.fetchall()
-
         message = f"📊 *Monthly Report for {today.strftime('%B, %Y')}*\n\nTotal Expenses: *{total_expense:.2f}*\n\n*Breakdown by Category:*\n"
         for category, amount in category_expenses:
             message += f"- {category}: {amount:.2f}\n"
-        await update.message.reply_text(message, parse_mode='Markdown')
+        await update.reply_text(message, parse_mode='Markdown')
     except Exception:
         logging.exception(f"Error generating report for user {user_id}")
-        await update.message.reply_text("I'm sorry, an error occurred while generating your report.")
+        await update.reply_text("I'm sorry, an error occurred while generating your report.")
 
-async def set_budget_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    categories = get_expense_categories(update.effective_user.id)
+
+async def set_budget_command(update: Update, context: ContextTypes.DEFAULT_TYPE, is_button=False) -> int:
+    message = "Please select a category for the budget or type a new one:"
+    user_id = update.effective_user.id
+    categories = get_expense_categories(user_id)
     keyboard = build_category_keyboard(categories) if categories else None
-    await update.message.reply_text('Please select a category for the budget or type a new one:', reply_markup=keyboard)
+    target = update.edit_message_text if is_button else update.reply_text
+    await target(text=message, reply_markup=keyboard)
     return SET_BUDGET_CATEGORY
 
+# ... (set_budget_category and set_budget_amount are the same)
 async def set_budget_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data['budget_category'] = update.message.text.strip()
     await update.message.reply_text("Please enter the monthly budget amount for this category:")
@@ -174,15 +210,13 @@ async def set_budget_category(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def set_budget_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
-    category_name = context.user_data['budget_category']
+    category__name = context.user_data['budget_category']
     amount_text = update.message.text.strip()
-    
     try:
         amount = Decimal(amount_text)
         if amount <= 0:
             await update.message.reply_text("Amount must be a positive number. Please try again.")
             return SET_BUDGET_AMOUNT
-            
         with get_db_connection() as conn:
             with conn.cursor() as cur:
                 category_id = get_or_create_category_id(cur, user_id, category_name)
@@ -201,7 +235,10 @@ async def set_budget_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         context.user_data.clear()
     return ConversationHandler.END
 
+
+# --- THIS IS THE MISSING FUNCTION ---
 async def view_budget_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the /view_budget command."""
     user_id = update.effective_user.id
     try:
         with get_db_connection() as conn:
@@ -213,22 +250,25 @@ async def view_budget_command(update: Update, context: ContextTypes.DEFAULT_TYPE
                 budgets = cur.fetchall()
         
         if not budgets:
-            await update.message.reply_text('You have no budgets set yet. Use /set_budget to create one.')
+            await update.reply_text('You have no budgets set yet. Use "Set Budget" to create one.')
             return
             
         message = "Your current monthly budgets:\n\n"
         for budget in budgets:
             message += f"📂 *{budget[0]}*: {budget[1]:.2f}\n"
-        await update.message.reply_text(message, parse_mode='Markdown')
+        await update.reply_text(message, parse_mode='Markdown')
     except Exception:
         logging.exception(f"Error retrieving budgets for user {user_id}")
-        await update.message.reply_text("I'm sorry, an error occurred while retrieving your budgets.")
+        await update.reply_text("I'm sorry, an error occurred while retrieving your budgets.")
 
-async def delete_expense_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await view_expenses_command(update, context) # This might show an error if view_expenses fails, which is okay.
-    await update.message.reply_text("\nAbove are your recent expenses. Please enter the ID of the expense you want to delete:")
+
+async def delete_expense_command(update: Update, context: ContextTypes.DEFAULT_TYPE, is_button=False) -> int:
+    message = "Please enter the ID of the expense you want to delete. You can find the ID using /view_expenses."
+    target = update.edit_message_text if is_button else update.reply_text
+    await target(text=message)
     return DELETE_EXPENSE_ID
-    
+
+# ... (delete_expense_id and cancel are the same)
 async def delete_expense_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
     expense_id_text = update.message.text.strip()
@@ -250,7 +290,7 @@ async def delete_expense_id(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text("An error occurred while trying to delete the expense.")
     return ConversationHandler.END
 
-# Dummy cancel function for states without a specific one.
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Cancels and ends the conversation."""
     await update.message.reply_text('Operation cancelled.', reply_markup=ReplyKeyboardRemove())
